@@ -33,27 +33,72 @@ app.use(morgan("dev"));
 const __dirname = path.resolve();
 app.use("/uploads", express.static(path.join(__dirname, "/uploads")));
 
-// Vercel serverless DB connection middleware
-app.use(async (req, res, next) => {
-  if (process.env.VERCEL) {
-    if (mongoose.connection.readyState !== 1) {
-      if (process.env.MONGO_URI) {
-        try {
-          await mongoose.connect(process.env.MONGO_URI);
-        } catch (err) {
-          console.error("Vercel MongoDB connection error:", err);
-        }
-      } else {
-        console.warn("WARNING: MONGO_URI environment variable is not set on Vercel.");
-      }
-    }
+// Database connection helper with connection pooling and cached promise for serverless/Vercel
+let cachedPromise = null;
+
+export const connectDB = async () => {
+  // If already connected, reuse connection
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
   }
-  next();
+
+  const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error("MONGO_URI environment variable is not defined.");
+  }
+
+  // If a connection is already in progress, wait for it
+  if (!cachedPromise) {
+    const opts = {
+      serverSelectionTimeoutMS: 5000, // Fail fast after 5s instead of hanging
+    };
+    cachedPromise = mongoose.connect(uri, opts).catch((err) => {
+      cachedPromise = null;
+      throw err;
+    });
+  }
+
+  try {
+    await cachedPromise;
+    return mongoose.connection;
+  } catch (err) {
+    cachedPromise = null;
+    throw err;
+  }
+};
+
+// Database connection middleware for API routes
+app.use(async (req, res, next) => {
+  // Skip database connection check for non-API routes and health check
+  if (!req.path.startsWith("/api") || req.path === "/api/health") {
+    return next();
+  }
+
+  // If already connected, proceed immediately
+  if (mongoose.connection.readyState === 1) {
+    return next();
+  }
+
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error("MongoDB connection error:", err.message);
+    return res.status(500).json({
+      message: `Database connection error: ${err.message}`,
+    });
+  }
 });
 
 // Routes
 app.get("/api/health", (req, res) => {
-  res.status(200).json({ status: "ok", message: "API is running" });
+  const states = ["disconnected", "connected", "connecting", "disconnecting"];
+  const dbStatus = states[mongoose.connection.readyState] || "unknown";
+  res.status(200).json({
+    status: "ok",
+    message: "API is running",
+    database: dbStatus,
+  });
 });
 
 app.use("/api/users", userRoutes);
@@ -91,33 +136,37 @@ const PORT = process.env.PORT || 5001;
 
 let mongoServer;
 const startServer = async () => {
-  try {
-    let uri = process.env.MONGO_URI;
+  const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
 
-    if (uri) {
+  if (uri) {
+    try {
       // Connect to Permanent MongoDB
-      await mongoose.connect(uri);
+      await connectDB();
       console.log(`Connected to Permanent MongoDB Atlas / Local`);
 
       // Always run seed check to ensure missing default users are created
       await seedDatabase();
-    } else {
+    } catch (err) {
+      console.error("MongoDB connection error at startup:", err.message);
+    }
+  } else {
+    try {
       // Fallback to In-Memory MongoDB for development
       mongoServer = await MongoMemoryServer.create();
-      uri = mongoServer.getUri();
-      await mongoose.connect(uri);
-      console.log(`Connected to In-Memory MongoDB: ${uri}`);
+      const memUri = mongoServer.getUri();
+      await mongoose.connect(memUri);
+      console.log(`Connected to In-Memory MongoDB: ${memUri}`);
 
       // Always seed in-memory
       await seedDatabase();
+    } catch (err) {
+      console.error("In-Memory MongoDB startup error:", err.message);
     }
-
-    server.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
   }
+
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 };
 
 // Start standalone server unless executed within Vercel serverless functions
